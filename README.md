@@ -1,3 +1,6 @@
+
+Creating a new branch is quick.
+
 ## Welcome to Pano2Room!
 
 [Pano2Room: Novel View Synthesis from a Single Indoor Panorama (SIGGRAPH Asia 2024)](https://arxiv.org/abs/2408.11413).

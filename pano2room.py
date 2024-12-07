@@ -41,51 +41,66 @@ class Pano2RoomPipeline(torch.nn.Module):
     def __init__(self, attempt_idx=""):
         super().__init__()
 
-        # renderer setting
-        self.blur_radius = 0
-        self.faces_per_pixel = 8
-        self.fov = 90
-        self.R, self.T = torch.Tensor([[[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]]), torch.Tensor([[0., 0., 0.]])
-        self.pano_width, self.pano_height = 1024 * 2, 512 * 2
-        self.H, self.W = 512, 512
-        self.device = "cuda:0"
+        # 渲染器设置
+        self.blur_radius = 0  # 模糊半径，用于渲染时的平滑处理
+        self.faces_per_pixel = 8  # 每个像素的面数，影响渲染质量
+        self.fov = 90  # 视场角度
+        self.R, self.T = torch.Tensor([[[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]]), torch.Tensor([[0., 0., 0.]])  # 旋转和平移矩阵
+        self.pano_width, self.pano_height = 1024 * 2, 512 * 2  # 全景图尺寸
+        self.H, self.W = 512, 512  # 输出图像尺寸
+        self.device = "cuda:0"  # 使用的设备
 
-        # initialize
-        self.rendered_depth = torch.zeros((self.H, self.W), device=self.device) 
-        self.inpaint_mask = torch.ones((self.H, self.W), device=self.device, dtype=torch.bool)  
-        self.vertices = torch.empty((3, 0), device=self.device, requires_grad=False)
-        self.colors = torch.empty((3, 0), device=self.device, requires_grad=False)
-        self.faces = torch.empty((3, 0), device=self.device, dtype=torch.long, requires_grad=False)
-        self.pix_to_face = None
+        # 初始化渲染相关的张量
+        self.rendered_depth = torch.zeros((self.H, self.W), device=self.device)  # 渲染的深度图
+        self.inpaint_mask = torch.ones((self.H, self.W), device=self.device, dtype=torch.bool)  # 修复遮罩
+        self.vertices = torch.empty((3, 0), device=self.device, requires_grad=False)  # 顶点坐标
+        self.colors = torch.empty((3, 0), device=self.device, requires_grad=False)  # 顶点颜色
+        self.faces = torch.empty((3, 0), device=self.device, dtype=torch.long, requires_grad=False)  # 面片索引
+        self.pix_to_face = None  # 像素到面片的映射
 
-        self.pose_scale = 0.6
-        self.pano_center_offset = (-0.2,0.3)
-        self.inpaint_frame_stride = 20   
+        # 场景参数设置
+        self.pose_scale = 0.6  # 姿态缩放因子
+        self.pano_center_offset = (-0.2,0.3)  # 全景图中心偏移
+        self.inpaint_frame_stride = 20  # 修复帧的步长
 
-        # create exp dir
+        # 创建输出目录
         self.setting = f""
         apply_timestamp = True
         if apply_timestamp:
             timestamp = str(int(time.time()))[-8:]
             self.setting += f"-{timestamp}"
-        self.save_path = f'output/Pano2Room-results'
-        self.save_details = False
+        self.save_path = f'output/Pano2Room-results'  # 结果保存路径
+        self.save_details = False  # 是否保存详细信息
 
+        # 创建输出目录（如果不存在）
         if not os.path.exists(self.save_path):
             os.makedirs(self.save_path)
             print("makedir:", self.save_path)
 
-        self.world_to_cam = torch.eye(4, dtype=torch.float32, device=self.device)
-        self.cubemap_w2c_list = functions.get_cubemap_views_world_to_cam()
+        # 初始化相机变换矩阵
+        self.world_to_cam = torch.eye(4, dtype=torch.float32, device=self.device)  # 世界坐标到相机坐标的变换矩阵
+        self.cubemap_w2c_list = functions.get_cubemap_views_world_to_cam()  # 获取立方体贴图的视图变换矩阵列表
 
+        # 加载必要的模块
         self.load_modules()
 
     def load_modules(self):
+        """加载必要的模块
+        - inpainter: 用于全景图修复的模块
+        - geo_predictor: 用于几何预测的模块
+        """
         self.inpainter = PanoPersFusionInpainter(save_path=self.save_path)
         self.geo_predictor = PanoJointPredictor(save_path=self.save_path)
 
     def project(self, world_to_cam):
-        # project mesh into pose and render (rgb, depth, mask)
+        """将3D网格投影到2D视图并进行渲染
+        Args:
+            world_to_cam: 世界坐标到相机坐标的变换矩阵
+        Returns:
+            rendered_image_tensor: 渲染的图像张量
+            rendered_image_pil: 渲染的PIL图像
+        """
+        # 投影网格并渲染（RGB、深度、遮罩）
         rendered_image_tensor, self.rendered_depth, self.inpaint_mask, self.pix_to_face, self.z_buf, self.mesh = render_mesh(
             vertices=self.vertices,
             faces=self.faces,
@@ -97,31 +112,43 @@ class Pano2RoomPipeline(torch.nn.Module):
             blur_radius=self.blur_radius,
             faces_per_pixel=self.faces_per_pixel
         )
-        # mask rendered_image_tensor
+        # 使用遮罩处理渲染图像
         rendered_image_tensor = rendered_image_tensor * ~self.inpaint_mask
 
-        # stable diffusion models want the mask and image as PIL images
+        # 将渲染结果转换为PIL图像格式
         rendered_image_pil = Image.fromarray((rendered_image_tensor.permute(1, 2, 0).detach().cpu().numpy()[..., :3] * 255).astype(np.uint8))
         self.inpaint_mask_pil = Image.fromarray(self.inpaint_mask.detach().cpu().squeeze().float().numpy() * 255).convert("RGB")
 
+        # 保存当前状态以便恢复
         self.inpaint_mask_restore = self.inpaint_mask
         self.inpaint_mask_pil_restore = self.inpaint_mask_pil
 
         return rendered_image_tensor[:3, ...], rendered_image_pil
 
     def render_pano(self, pose):
+        """渲染全景图
+        Args:
+            pose: 相机姿态
+        Returns:
+            pano_rgb: 渲染的RGB全景图
+            pano_depth: 渲染的深度全景图
+            pano_mask: 渲染的遮罩全景图
+        """
         cubemap_list = [] 
+        # 遍历立方体贴图的六个面
         for cubemap_pose in self.cubemap_w2c_list:
             pose_tmp = pose.clone()
             pose_tmp = cubemap_pose.cuda() @ pose_tmp
             rendered_image_tensor, rendered_image_pil = self.project(pose_tmp.cuda())
 
+            # 准备立方体贴图的各个通道
             rgb_CHW = rendered_image_tensor.squeeze(0).cuda()
             depth_CHW = self.rendered_depth.unsqueeze(0).cuda()
             distance_CHW = functions.depth_to_distance(depth_CHW)
             mask_CHW = self.inpaint_mask.unsqueeze(0).cuda()
             cubemap_list += [torch.cat([rgb_CHW, distance_CHW, mask_CHW], axis=0)]
 
+        # 将立方体贴图转换为全景图
         torch.set_default_tensor_type('torch.FloatTensor')
         pano_rgbd = cube2equi(cubemap_list,
                                 "list",
@@ -133,6 +160,15 @@ class Pano2RoomPipeline(torch.nn.Module):
         return pano_rgb, pano_depth, pano_mask  # CHW, HW, HW
 
     def rgbd_to_mesh(self, rgb, depth, world_to_cam=None, mask=None, pix_to_face=None, using_distance_map=False):
+        """将RGBD图像转换为3D网格
+        Args:
+            rgb: RGB图像数据
+            depth: 深度图数据
+            world_to_cam: 世界坐标到相机坐标的变换矩阵（可选）
+            mask: 遮罩图像（可选）
+            pix_to_face: 像素到面片的映射（可选）
+            using_distance_map: 是否使用距离图（默认False）
+        """
         predicted_depth = depth.cuda()
         rgb = rgb.squeeze(0).cuda()
         if world_to_cam is None:
@@ -148,6 +184,7 @@ class Pano2RoomPipeline(torch.nn.Module):
         if self.inpaint_mask.sum() == 0:
             return
         
+        # 将���征转换为世界空间中的网格
         vertices, faces, colors = features_to_world_space_mesh(
             colors=rgb,
             depth=predicted_depth,
@@ -161,66 +198,107 @@ class Pano2RoomPipeline(torch.nn.Module):
             edge_threshold=0.05
         )
 
+        # 更新面片索引
         faces += self.vertices.shape[1] 
 
+        # 保存当前状态以便恢复
         self.vertices_restore = self.vertices.clone()
         self.colors_restore = self.colors.clone()
         self.faces_restore = self.faces.clone()
 
+        # 更新网格数据
         self.vertices = torch.cat([self.vertices, vertices], dim=1)
         self.colors = torch.cat([self.colors, colors], dim=1)
         self.faces = torch.cat([self.faces, faces], dim=1)
 
     def find_depth_edge(self, depth, dilate_iter=0):
+        """查找深度图的边缘
+        Args:
+            depth: 深度图数据
+            dilate_iter: 膨胀迭代次数（默认0）
+        Returns:
+            edges: 边缘图像
+        """
+        # 将深度图归一化到0-255范围
         gray = (depth/depth.max() * 255).astype(np.uint8)
+        # 使Canny算子检测边缘
         edges = cv2.Canny(gray, 60, 150)
+        # 如果需要，对边缘进行膨胀处理
         if dilate_iter > 0:
             kernel = np.ones((3, 3), np.uint8)
             edges = cv2.dilate(edges, kernel, iterations=dilate_iter)
         return edges
 
     def pano_distance_to_mesh(self, pano_rgb, pano_distance, depth_edge_inpaint_mask, pose=None):
+        """将全景距离图转换为3D网格
+        Args:
+            pano_rgb: 全景RGB图像
+            pano_distance: 全景距离图
+            depth_edge_inpaint_mask: 深度边缘修复遮罩
+            pose: 相机姿态（可选）
+        """
         self.rgbd_to_mesh(pano_rgb, pano_distance, mask=depth_edge_inpaint_mask, using_distance_map=True, world_to_cam=pose)
  
     def load_inpaint_poses(self):
+        """加载用于修复的相机姿态
+        Returns:
+            pose_dict: 包含相机姿态的字典，格式为 {idx: pose}
+        """
+        # 渲染当前视角的全景图
         pano_rgb, pano_distance, pano_mask = self.render_pano(self.world_to_cam)
 
         pose_dict = {} # {idx:pose, ...} # pose are c2w
         key = 0
 
+        # 按照指定步长采样相机姿态
         sampled_inpaint_poses = self.poses[::self.inpaint_frame_stride]
         for anchor_idx in range(len(sampled_inpaint_poses)):
             pose = torch.eye(4).float() # pano pose dosen't support rotations
 
+            # 转换相机姿态
             pose_44 = sampled_inpaint_poses[anchor_idx].clone()
             pose_44 = pose_44.float()
-            Rw2c = pose_44[:3,:3].cpu().numpy()
-            Tw2c = pose_44[:3,3:].cpu().numpy()
-            yz_reverse = np.array([[1,0,0], [0,1,0], [0,0,1]])
-            Rc2w = np.matmul(yz_reverse, Rw2c).T
-            Tc2w = -np.matmul(Rc2w, np.matmul(yz_reverse, Tw2c))
-            Pc2w = np.concatenate((Rc2w, Tc2w), axis=1)
-            Pc2w = np.concatenate((Pc2w, np.array([[0,0,0,1]])), axis=0) 
+            Rw2c = pose_44[:3,:3].cpu().numpy()  # 世界到相机的旋转矩阵
+            Tw2c = pose_44[:3,3:].cpu().numpy()  # 世界到相机的平移向量
+            yz_reverse = np.array([[1,0,0], [0,1,0], [0,0,1]])  # YZ轴反转矩阵
+            
+            # 计算相机到世界的变换
+            Rc2w = np.matmul(yz_reverse, Rw2c).T  # 相机到世界的旋转矩阵
+            Tc2w = -np.matmul(Rc2w, np.matmul(yz_reverse, Tw2c))  # 相机到世界的平移向量
+            Pc2w = np.concatenate((Rc2w, Tc2w), axis=1)  # 组合旋转和平移
+            Pc2w = np.concatenate((Pc2w, np.array([[0,0,0,1]])), axis=0)  # 添加齐次坐标
+            
+            # 更新姿态信息
             pose[:3, 3] = torch.tensor(Pc2w[:3, 3]).cuda().float()
             pose[:3, 3] *= -1
             pose_dict[key] = pose.clone()
 
             key += 1
-        return  pose_dict
+        return pose_dict
 
     def stage_inpaint_pano_greedy_search(self, pose_dict): 
+        """使用贪婪搜索策略进行全景图修复
+        Args:
+            pose_dict: 包含相机姿态的字典
+        Returns:
+            inpainted_panos_and_poses: 修复后的全景图和对应姿态的列表
+        """
         print("stage_inpaint_pano_greedy_search")
+        # 渲染初始全景图
         pano_rgb, pano_distance, pano_mask = self.render_pano(self.world_to_cam)
 
         inpainted_panos_and_poses = []
         while len(pose_dict) > 0:
             print(f"len(pose_dict):{len(pose_dict)}")
 
+            # 评估所有采样姿态
             values_sampled_poses = []
             keys = list(pose_dict.keys())
             for key in keys:
                 pose = pose_dict[key]
+                # 渲染当前姿态的全景图
                 pano_rgb, pano_distance, pano_mask = self.render_pano(pose.cuda())
+                # 计算视图完整度（未被遮挡的区域比例）
                 view_completeness = torch.sum((1 - pano_mask * 1))/(pano_mask.shape[0] * pano_mask.shape[1])
                 
                 values_sampled_poses += [(key, view_completeness, pose)]
@@ -228,9 +306,8 @@ class Pano2RoomPipeline(torch.nn.Module):
             if len(values_sampled_poses) < 1:
                 break
 
-            # find inpainting with least view completeness
+            # 根据视图完整度排序，选择最不完整的视图进行修复
             values_sampled_poses = sorted(values_sampled_poses, key=lambda item: item[1])
-            # least_complete_view = values_sampled_poses[0]
             least_complete_view = values_sampled_poses[len(values_sampled_poses)*2//3]
 
             key, view_completeness, pose = least_complete_view
@@ -286,9 +363,20 @@ class Pano2RoomPipeline(torch.nn.Module):
         return inpainted_panos_and_poses
 
     def inpaint_new_panorama(self, idx, colors, distances, pano_mask):
+        """修复新的全景图
+        Args:
+            idx: 全景图索引
+            colors: RGB颜色数据
+            distances: 距离图数据
+            pano_mask: 全景图遮罩
+        Returns:
+            inpainted_img: 修复后的图像
+            inpainted_distances: 修复后的距离图
+            inpainted_normals: 修复后的法线图
+        """
         print(f"inpaint_new_panorama")
 
-        # must dilate mask first
+        # 必须先对遮罩进行膨胀处理
         mask = pano_mask.unsqueeze(-1)
         s_size = (9, 9)
         kernel_s = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, s_size)
@@ -304,12 +392,14 @@ class Pano2RoomPipeline(torch.nn.Module):
         inpainted_distances = None
         inpainted_normals = None
 
+        # 使用修复器修复图像
         inpainted_img = self.inpainter.inpaint(idx, colors, mask)
 
-        # Keep renderred part
+        # 保持已渲染部分不变
         inpainted_img = colors * (1 - mask) + inpainted_img * mask
         inpainted_img = inpainted_img.cuda()
 
+        # 使用几何预测器生成距离图和法线图
         inpainted_distances, inpainted_normals = self.geo_predictor(idx,
                                                                     inpainted_img,
                                                                     distances,
@@ -322,6 +412,12 @@ class Pano2RoomPipeline(torch.nn.Module):
         return inpainted_img, inpainted_distances, inpainted_normals
 
     def load_pano(self):
+        """加载全景图和深度图
+        Returns:
+            panorama_tensor: 全景图张量
+            depth: 深度图数据
+        """
+        # 加载全景图像
         image_path = f"input/input_panorama.png"
         image = Image.open(image_path)
         if image.size[0] < image.size[1]:
@@ -330,15 +426,16 @@ class Pano2RoomPipeline(torch.nn.Module):
         panorama_tensor = torch.tensor(np.array(image))[...,:3].permute(2,0,1).unsqueeze(0).float()/255
         panorama_image_pil = functions.tensor_to_pil(panorama_tensor)
 
+        # 深度缩放因子
         depth_scale_factor = 3.4092
 
-        # get panofusion_distance
+        # 使用PanoFusion预测深度
         pano_fusion_distance_predictor = PanoFusionDistancePredictor()
         depth = pano_fusion_distance_predictor.predict(panorama_tensor.squeeze(0).permute(1,2,0)) #input:HW3
         depth = depth/depth.max() * depth_scale_factor
         print(f"pano_fusion_distance...[{depth.min(), depth.mean(),depth.max()}]")
         
-        return panorama_tensor, depth# panorama_tensor:BCHW, depth:HW
+        return panorama_tensor, depth  # panorama_tensor:BCHW, depth:HW
 
     def load_camera_poses(self, pano_center_offset=[0,0]):
         subset_path = f'input/Camera_Trajectory' # initial 6 poses are cubemaps poses
@@ -351,6 +448,8 @@ class Pano2RoomPipeline(torch.nn.Module):
         pose_files = sorted(pose_files)
         poses_name = pose_files
         poses = []
+        
+        # 遍历所有姿态文件
         for i, pose_name in enumerate(poses_name):
             with open(f'{subset_path}/{pose_name}', 'r') as f: 
                 lines = f.readlines()
@@ -397,6 +496,7 @@ class Pano2RoomPipeline(torch.nn.Module):
         return perspective
 
     def pano_to_cubemap(self, pano_tensor, pano_depth_tensor=None): #BCHW, HW
+        # 定义立方体贴图的6个面的方向（pitch和yaw角度）
         cubemaps_pitch_yaw = [(0, 0), (0, 3/2 * np.pi), (0, 1 * np.pi), (0, 1/2 * np.pi),\
                             (-1/2 * np.pi, 0), (1/2 * np.pi, 0)]
         pitch_yaw_list = cubemaps_pitch_yaw
@@ -491,17 +591,22 @@ class Pano2RoomPipeline(torch.nn.Module):
         print("Result saved at: ", self.save_path)
             
     def run(self):
+        # 设置默认张量类型
         torch.set_default_tensor_type('torch.cuda.FloatTensor')
+        
+        # 加载相机姿态和全景图数据
         self.pano_pose, self.poses = self.load_camera_poses(self.pano_center_offset)
         pano_rgb, pano_depth = self.load_pano()
         panorama_tensor, init_depth = pano_rgb.squeeze(0).cuda(), pano_depth.cuda()
 
+        # 处理深度边缘
         depth_edge = self.find_depth_edge(init_depth.cpu().detach().numpy(), dilate_iter=1)
         depth_edge_pil = Image.fromarray(depth_edge)
         depth_pil = Image.fromarray(visualize_depth_numpy(init_depth.cpu().detach().numpy())[0].astype(np.uint8))
         _, _ = save_rgbd(depth_pil, depth_edge_pil, f'depth_edge', 0, self.save_path)  
         depth_edge_inpaint_mask = ~(torch.from_numpy(depth_edge).cuda().bool()) 
 
+        # 初始化监督信息池
         self.sup_pool = SupInfoPool()
         self.sup_pool.register_sup_info(pose=torch.eye(4).cuda(),
                                         mask=torch.ones([self.pano_height, self.pano_width]),
@@ -509,98 +614,52 @@ class Pano2RoomPipeline(torch.nn.Module):
                                         distance=init_depth.unsqueeze(-1))
         self.sup_pool.gen_occ_grid(256)
 
-        # Pano2Mesh
+        # Pano2Mesh转换
         self.pano_distance_to_mesh(panorama_tensor, init_depth, depth_edge_inpaint_mask)
 
-        # Mesh Inpainting        
+        # Mesh修复
         pose_dict = self.load_inpaint_poses()
         print(f"start inpainting with poses #{len(self.poses)}")
         inpainted_panos_and_poses = self.stage_inpaint_pano_greedy_search(pose_dict)
 
-        # Train 3DGS
-        self.opt = GSParams()
-        self.cam = CameraParams()
-        self.gaussians = GaussianModel(self.opt.sh_degree)
-        self.opt.white_background = True
-        bg_color = [1, 1, 1] if self.opt.white_background else [0, 0, 0]
-        self.background = torch.tensor(bg_color, dtype=torch.float32, device='cuda')
-        
-        traindata = {
-            'camera_angle_x': self.cam.fov[0],
-            'W': self.W,
-            'H': self.H,
-            'pcd_points': self.vertices.detach().cpu(),
-            'pcd_colors': self.colors.permute(1,0).detach().cpu(),
-            'frames': [],
-        }
-        for inpainted_pano_images, pano_pose_44 in inpainted_panos_and_poses:
-            cubemaps, cubemaps_depth = self.pano_to_cubemap(inpainted_pano_images) # BCHW
-            for i in range(len(cubemaps)):
-                inpainted_img = cubemaps[i] 
+        # 直接导出mesh
+        mesh_output_path = os.path.join(self.save_path, 'reconstructed_mesh.ply')
+        self.save_mesh(mesh_output_path)
+        print(f"Mesh saved at: {mesh_output_path}")
 
-                mesh_pose = self.cubemap_w2c_list[i].cuda() @ pano_pose_44.clone()
+    def save_mesh(self, output_path):
+        """保存mesh到PLY文件
+        Args:
+            output_path: 输出文件路径
+        """
+        # 准备顶点和颜色数据
+        vertices = self.vertices.detach().cpu().numpy().T  # 转置为(N, 3)格式
+        colors = (self.colors.detach().cpu().numpy().T * 255).astype(np.uint8)  # 转换为0-255范围
+        faces = self.faces.detach().cpu().numpy().T  # 转置为(N, 3)格式
 
-                pose_44 = mesh_pose.clone()
-                pose_44 = pose_44.float()
-                pose_44[0:1,:] *= -1
-                pose_44[1:2,:] *= -1
+        # 创建PLY文件
+        with open(output_path, 'w') as f:
+            # 写入文件头
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {len(vertices)}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
+            f.write(f"element face {len(faces)}\n")
+            f.write("property list uchar int vertex_indices\n")
+            f.write("end_header\n")
 
-                Rw2c = pose_44[:3,:3].cpu().numpy()
-                Tw2c = pose_44[:3,3:].cpu().numpy()
-                yz_reverse = np.array([[1,0,0], [0,-1,0], [0,0,-1]])
+            # 写入顶点和颜色数据
+            for vertex, color in zip(vertices, colors):
+                f.write(f"{vertex[0]} {vertex[1]} {vertex[2]} {color[0]} {color[1]} {color[2]}\n")
 
-                Rc2w = np.matmul(yz_reverse, Rw2c).T
-                Tc2w = -np.matmul(Rc2w, np.matmul(yz_reverse, Tw2c))
-                Pc2w = np.concatenate((Rc2w, Tc2w), axis=1)
-                Pc2w = np.concatenate((Pc2w, np.array([[0,0,0,1]])), axis=0)  
-
-                traindata['frames'].append({
-                    'image': functions.tensor_to_pil(inpainted_img),
-                    'transform_matrix': Pc2w.tolist(), 
-                    'fovx': focal2fov(256, inpainted_img.shape[-1]),
-                    'mesh_pose': mesh_pose
-                })
-
-
-        self.scene = Scene(traindata, self.gaussians, self.opt)   
-        self.train_GS()
-        outfile = self.gaussians.save_ply(os.path.join(self.save_path, '3DGS.ply'))
-
-        # Eval GS
-        evaldata = {
-            'camera_angle_x': self.cam.fov[0],
-            'W': self.W,
-            'H': self.H,
-            'frames': [],
-        }
-
-        for i in range(len(self.poses)):
-            gt_img = inpainted_img
-
-            pose_44 = self.poses[i].clone()
-            pose_44 = pose_44.float()
-            pose_44[0:1,:] *= -1
-            pose_44[1:2,:] *= -1
-
-            Rw2c = pose_44[:3,:3].cpu().numpy()
-            Tw2c = pose_44[:3,3:].cpu().numpy()
-            yz_reverse = np.array([[1,0,0], [0,-1,0], [0,0,-1]])
-
-            Rc2w = np.matmul(yz_reverse, Rw2c).T
-            Tc2w = -np.matmul(Rc2w, np.matmul(yz_reverse, Tw2c))
-            Pc2w = np.concatenate((Rc2w, Tc2w), axis=1)
-            Pc2w = np.concatenate((Pc2w, np.array([[0,0,0,1]])), axis=0)                  
-
-            evaldata['frames'].append({
-                'image': functions.tensor_to_pil(gt_img),
-                'transform_matrix': Pc2w.tolist(), 
-                'fovx': focal2fov(256, gt_img.shape[-1]),
-                'mesh_pose': self.poses[i].clone()
-            })
-        from scene.dataset_readers import loadCamerasFromData
-        eval_GS_cams = loadCamerasFromData(evaldata, self.opt.white_background)
-        self.eval_GS(eval_GS_cams)
-
+            # 写入面片数据
+            for face in faces:
+                f.write(f"3 {face[0]} {face[1]} {face[2]}\n")
 
 pipeline = Pano2RoomPipeline()
 pipeline.run()
